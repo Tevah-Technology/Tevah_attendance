@@ -4,3 +4,5 @@ backups/
 *.log
 .DS_Store
 __MACOSX/
+.vercel
+.env*.local
