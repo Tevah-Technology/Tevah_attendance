@@ -1,0 +1,23 @@
+{
+  "name": "zkteco-f28-attendance-backend",
+  "version": "4.2.0",
+  "description": "Full-featured Node.js backend for ZKTeco F28 attendance management",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && find src -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "zk:test": "node test-zk.js",
+    "zk:sync": "node test-sync.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mongoose": "^8.9.5",
+    "node-zklib": "file:vendor/node-zklib",
+    "pdfkit": "^0.15.0",
+    "xlsx": "^0.18.5"
+  }
+}
