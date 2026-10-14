@@ -50,6 +50,22 @@ function validateEnvironment() {
   }
 
   process.env.MONGODB_URI = mongoUri;
+
+  // Safe Mongo diagnostics: username/host/database only.
+  // Never log the password or the full connection string.
+  try {
+    const parsed = new URL(mongoUri);
+
+    console.log('[MONGO CONFIG]');
+    console.log('User:', decodeURIComponent(parsed.username || ''));
+    console.log('Host:', parsed.hostname);
+    console.log(
+      'Database:',
+      parsed.pathname.replace(/^\/+/, '') || '(default)'
+    );
+  } catch (_) {
+    console.warn('[MONGO CONFIG] Unable to parse URI for diagnostics');
+  }
 }
 
 // ============================================================
@@ -62,10 +78,13 @@ async function initializeApplication() {
   if (!initializationPromise) {
     initializationPromise = (async () => {
       validateEnvironment();
+
       await connectDatabase();
       await ensureBootstrapAdmin();
+
       return true;
     })().catch((error) => {
+      // Permit a later request/invocation to retry after transient failure.
       initializationPromise = null;
       throw error;
     });
@@ -86,6 +105,7 @@ const allowedOrigins = String(process.env.CORS_ORIGIN || '')
 app.use(
   cors({
     origin(origin, callback) {
+      // curl/Postman/server-to-server requests normally do not send Origin.
       if (!origin) {
         return callback(null, true);
       }
@@ -153,7 +173,7 @@ app.use(async (req, res, next) => {
       message: 'Backend initialization failed.',
       error:
         process.env.NODE_ENV === 'production'
-          ? error.message
+          ? 'Database connection failed.'
           : (error.stack || error.message)
     });
   }
