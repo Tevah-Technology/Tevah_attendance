@@ -8,7 +8,7 @@ const ALLOWED_FIELDS = new Set([
   'halfDayEnabled', 'halfDayMinutes', 'fullDayMinutes', 'twoHalfDaysEqualOneDay',
   'attendanceUseEnvHours', 'morningStartTime', 'lateAfterTime', 'consecutiveLateThreshold',
   'consecutiveLatePenaltyUnits', 'middayAutoCheckoutTime', 'afternoonStartTime',
-  'dayEndAutoCheckoutTime', 'autoCheckoutEnabled'
+  'dayEndAutoCheckoutTime', 'autoCheckoutEnabled', 'noonAutoCheckoutEnabled', 'webLocationRequired'
 ]);
 
 function validate(body = {}) {
@@ -53,6 +53,8 @@ async function update(req, res) {
     const rule = existing
       ? await Rule.findByIdAndUpdate(existing._id, { $set: update }, { new: true, runValidators: true })
       : await Rule.create(update);
+    // Recompute currently open sessions when the admin changes a scheduling rule.
+    await require('../services/attendance.service').rescheduleOpenSessions();
     res.json({ success: true, rule });
   } catch (e) { res.status(400).json({ success: false, message: e.message }); }
 }

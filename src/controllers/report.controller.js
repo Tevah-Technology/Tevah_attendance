@@ -21,9 +21,49 @@ function parseDate(value, fallback = null) {
     return isValidDate(value) ? value : fallback;
   }
 
-  const parsed = new Date(value);
+  const text = String(value).trim();
+
+  // IMPORTANT:
+  // JavaScript parses a bare YYYY-MM-DD string as UTC.
+  // For attendance reports we need it to represent the requested
+  // local calendar day instead.
+  const localDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+
+  if (localDateMatch) {
+    const year = Number(localDateMatch[1]);
+    const month = Number(localDateMatch[2]);
+    const day = Number(localDateMatch[3]);
+
+    const parsed = new Date(
+      year,
+      month - 1,
+      day,
+      0,
+      0,
+      0,
+      0
+    );
+
+    return isValidDate(parsed) ? parsed : fallback;
+  }
+
+  const parsed = new Date(text);
 
   return isValidDate(parsed) ? parsed : fallback;
+}
+
+function localDateString(value) {
+  const d = new Date(value);
+
+  if (!isValidDate(d)) {
+    return '';
+  }
+
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+
+  return `${year}-${month}-${day}`;
 }
 
 function startOfDay(date) {
@@ -268,7 +308,7 @@ async function daily(req, res) {
 
     res.json({
       success: true,
-      date: from.toISOString().slice(0, 10),
+      date: localDateString(from),
       summary: aggregate(data),
       data,
     });

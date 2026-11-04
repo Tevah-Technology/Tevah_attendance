@@ -16,6 +16,8 @@ const {
   aggregateAttendanceUnits
 } = require('../utils/attendance-policy');
 
+const { createReportShiftResolver } = require('./shift-assignment.service');
+
 const {
   startOfDay,
   endOfDay,
@@ -65,7 +67,8 @@ function makeDaySummary(
   employee,
   shift,
   leave,
-  attendanceRule = {}
+  attendanceRule = {},
+  shiftContext = {}
 ) {
   const sorted = [...punches]
     .filter((punch) => punch && punch.timestamp)
@@ -96,6 +99,27 @@ function makeDaySummary(
     hasOpenInterval: intervals.some(item => item.open)
   }, policy);
 
+  const hasOpenInterval = intervals.some(item => item.open);
+  const isDateSpecificShift = ['single_date', 'date_range', 'recurring'].includes(String(shiftContext?.source || ''));
+
+  // Date-specific shifts are evaluated against that shift's own required minutes
+  // and credit value. This lets an approved 16:15-20:15 half shift count as
+  // 0.5 day without changing the company-wide 09:00-17:30 rules.
+  if (isDateSpecificShift && shift && !hasOpenInterval) {
+    const required = Math.max(1, Number(shift.requiredMinutes || policy.fullDayMinutes || 480));
+    const maxUnits = Math.max(0, Math.min(1, Number(shift.attendanceUnits ?? 1)));
+
+    if (workedMinutes >= required) {
+      attendanceClassification = maxUnits >= 1
+        ? { status: 'FULL_DAY', label: 'Full Day', attendanceUnits: 1, halfDay: false, fullDay: true, halfDayEligible: true }
+        : maxUnits >= 0.5
+          ? { status: 'HALF_DAY', label: 'Half Day', attendanceUnits: 0.5, halfDay: true, fullDay: false, halfDayEligible: true }
+          : { status: 'INCOMPLETE', label: 'Incomplete', attendanceUnits: 0, halfDay: false, fullDay: false, halfDayEligible: false };
+    } else if (maxUnits >= 1 && workedMinutes >= Math.min(policy.halfDayMinutes, required)) {
+      attendanceClassification = { status: 'HALF_DAY', label: 'Half Day', attendanceUnits: 0.5, halfDay: true, fullDay: false, halfDayEligible: true };
+    }
+  }
+
   if (policy.halfDayEnabled && policy.twoHalfDaysEqualOneDay && halfDayIntervals >= 2) {
     attendanceClassification = {
       ...attendanceClassification,
@@ -111,7 +135,7 @@ function makeDaySummary(
   // configured morning/afternoon sessions rather than requiring exactly 480
   // worked minutes. This preserves the 09:30 grace window: an employee who
   // checks in at 09:20 and completes both sessions is still a full day.
-  if (attendanceRule.halfDayEnabled !== false) {
+  if (attendanceRule.halfDayEnabled !== false && !isDateSpecificShift) {
     const morningStart = atTime(date, attendanceRule.morningStartTime || '09:00');
     const midday = atTime(date, attendanceRule.middayAutoCheckoutTime || '13:00');
     const afternoonStart = atTime(date, attendanceRule.afternoonStartTime || '13:30');
@@ -154,10 +178,23 @@ function makeDaySummary(
   // LATE
   // ----------------------------------------------------------
 
-  const ruleLateCutoff = atTime(date, attendanceRule.lateAfterTime || '09:30');
-  const lateMinutes = firstInPunch
-    ? Math.max(0, minutesBetween(ruleLateCutoff, firstInPunch.timestamp))
+  let lateCutoff = atTime(date, attendanceRule.lateAfterTime || '09:30');
+  if (isDateSpecificShift && shift?.startTime) {
+    lateCutoff = atTime(date, shift.startTime);
+    lateCutoff.setMinutes(lateCutoff.getMinutes() + Math.max(0, Number(shift.graceMinutes || 0)));
+  }
+  const rawLateMinutes = firstInPunch
+    ? Math.max(0, minutesBetween(lateCutoff, firstInPunch.timestamp))
     : 0;
+
+  const lateCompensationMinutes = firstInPunch
+    ? Math.max(0, Number(firstInPunch.lateCompensationMinutes || 0))
+    : 0;
+
+  const lateMinutes = Math.max(
+    0,
+    rawLateMinutes - lateCompensationMinutes
+  );
   const lateByRule = lateMinutes > 0;
 
   // ----------------------------------------------------------
@@ -289,10 +326,23 @@ function makeDaySummary(
 
     breakMinutes,
 
+    rawLateMinutes,
+
+    lateCompensationMinutes,
+
+    lateCompensationReason:
+      firstInPunch?.lateCompensationReason || '',
+
+    lateCompensatedAt:
+      firstInPunch?.lateCompensatedAt || null,
+
+    lateCompensatedBy:
+      firstInPunch?.lateCompensatedBy || null,
+
     lateMinutes,
 
     lateByRule,
-    lateCutoffTime: attendanceRule.lateAfterTime || '09:30',
+    lateCutoffTime: isDateSpecificShift && shift?.startTime ? lateCutoff.toTimeString().slice(0, 5) : (attendanceRule.lateAfterTime || '09:30'),
     consecutiveLateCount: 0,
     latePenaltyApplied: false,
 
@@ -301,8 +351,19 @@ function makeDaySummary(
     overtimeMinutes,
 
     requiredMinutes: Number(
-      shift?.requiredMinutes ?? 480
+      shift?.requiredMinutes ?? attendanceRule.fullDayMinutes ?? 480
     ),
+
+    shiftAssignment: shiftContext?.assignment ? {
+      id: shiftContext.assignment._id,
+      type: shiftContext.assignment.assignmentType,
+      date: shiftContext.assignment.date || null,
+      startDate: shiftContext.assignment.startDate || null,
+      endDate: shiftContext.assignment.endDate || null,
+      recurringDays: shiftContext.assignment.recurringDays || [],
+      notes: shiftContext.assignment.notes || ''
+    } : null,
+    shiftSource: shiftContext?.source || null,
 
     shift: shift
       ? {
@@ -318,6 +379,7 @@ function makeDaySummary(
             Number(
               shift.requiredMinutes ?? 480
             ),
+          attendanceUnits: Number(shift.attendanceUnits ?? 1),
           graceMinutes:
             Number(
               shift.graceMinutes || 0
@@ -402,6 +464,15 @@ async function getEmployeeAttendance(
 }
 
 
+// Optional, request-scoped performance diagnostics. No employee PII or credentials.
+const reportDiagnosticsEnabled = () =>
+  String(process.env.REPORT_DIAGNOSTICS || '').toLowerCase() === 'true';
+
+let reportDiagnosticSequence = 0;
+function reportDiagnosticLog(id, message) {
+  if (reportDiagnosticsEnabled()) console.log(`[REPORT ${id}] ${message}`);
+}
+
 // ============================================================
 // BUILD REPORT
 // ============================================================
@@ -412,6 +483,10 @@ async function buildReport({
   employeeId,
   employeeIds
 } = {}) {
+  const reportId = ++reportDiagnosticSequence;
+  const reportStartedAt = Date.now();
+  reportDiagnosticLog(reportId, 'START buildReport');
+
   const fromDate =
     startOfDay(
       from || new Date()
@@ -425,7 +500,10 @@ async function buildReport({
   const endDate =
     endOfDay(toDate);
 
+  const ruleStartedAt = Date.now();
   const attendanceRule = (await Rule.findOne().lean()) || {};
+  reportDiagnosticLog(reportId,
+    `Rule.findOne: ${Date.now() - ruleStartedAt}ms`);
   const lateThreshold = Math.max(1, Number(attendanceRule.consecutiveLateThreshold || 4));
   const lookbackDays = Math.max(30, lateThreshold * 10);
   const queryStartDate = startOfDay(fromDate);
@@ -454,6 +532,7 @@ async function buildReport({
     };
   }
 
+  const employeesStartedAt = Date.now();
   const employees =
     await Employee
       .find(employeeFilter)
@@ -462,6 +541,9 @@ async function buildReport({
       })
       .lean();
 
+  reportDiagnosticLog(reportId,
+    `Employee.find: ${Date.now() - employeesStartedAt}ms; count=${employees.length}; days=${iterateDays(queryStartDate, toDate).length}`);
+
   const rows = [];
 
   // ----------------------------------------------------------
@@ -469,18 +551,19 @@ async function buildReport({
   // ----------------------------------------------------------
 
   for (const employee of employees) {
-    const shift =
-      await getEmployeeShift(
-        employee
-      );
-
+    const employeeStartedAt = Date.now();
+    const punchStartedAt = Date.now();
+    reportDiagnosticLog(reportId, `START employee ${employee.employeeId}`);
     const punches =
       await getEmployeeAttendance(
         employee,
         queryStartDate,
         endDate
       );
+    reportDiagnosticLog(reportId,
+      `employee ${employee.employeeId} punches: ${Date.now() - punchStartedAt}ms; count=${punches.length}`);
 
+    const leavesStartedAt = Date.now();
     const leaves =
       await Leave.find({
         employeeId:
@@ -494,6 +577,8 @@ async function buildReport({
         approved: true
       })
       .lean();
+    reportDiagnosticLog(reportId,
+      `employee ${employee.employeeId} leaves: ${Date.now() - leavesStartedAt}ms; count=${leaves.length}`);
 
     // --------------------------------------------------------
     // Group punches by day
@@ -549,7 +634,16 @@ async function buildReport({
     // still know whether today is the 4th consecutive late working day.
     // --------------------------------------------------------
 
+    // Preload assignment and shift data once per employee. No attendance
+    // writes are performed; daily classification rules are unchanged.
+    const shiftPreloadStartedAt = Date.now();
+    const resolveShift = await createReportShiftResolver(employee, attendanceRule);
+    reportDiagnosticLog(reportId,
+      `employee ${employee.employeeId} shift preload: ${Date.now() - shiftPreloadStartedAt}ms`);
+
     let lateStreak = 0;
+    let shiftLookupMs = 0;
+    let shiftLookupCount = 0;
 
     for (
       const date of iterateDays(
@@ -568,13 +662,23 @@ async function buildReport({
         leaveByDay.get(key) ||
         null;
 
+      const shiftStartedAt = Date.now();
+      const shiftContext = resolveShift(date);
+      const shiftElapsedMs = Date.now() - shiftStartedAt;
+      shiftLookupMs += shiftElapsedMs;
+      shiftLookupCount++;
+      if (shiftElapsedMs > 500) {
+        reportDiagnosticLog(reportId,
+          `SLOW shift lookup ${employee.employeeId} ${dateKey(date)}: ${shiftElapsedMs}ms`);
+      }
       const row = makeDaySummary(
         date,
         dayPunches,
         employee,
-        shift,
+        shiftContext.shift,
         leave,
-        attendanceRule
+        attendanceRule,
+        shiftContext
       );
 
       // OFF days (for example Sunday) do not break a late-arrival streak.
@@ -596,8 +700,12 @@ async function buildReport({
 
       if (date >= fromDate) rows.push(row);
     }
+    reportDiagnosticLog(reportId,
+      `DONE employee ${employee.employeeId}: total=${Date.now() - employeeStartedAt}ms; shiftLookups=${shiftLookupCount}; shiftTotal=${shiftLookupMs}ms`);
   }
 
+  reportDiagnosticLog(reportId,
+    `DONE buildReport: total=${Date.now() - reportStartedAt}ms; outputRows=${rows.length}`);
   return rows;
 }
 
@@ -746,6 +854,7 @@ function aggregate(rows) {
         : 0
   };
 }
+
 
 
 module.exports = {

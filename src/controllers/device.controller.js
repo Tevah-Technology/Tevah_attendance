@@ -196,7 +196,11 @@ async function syncUsers(req, res) {
         deviceUid: user.uid,
         deviceUserId: user.userId,
         cardNo: user.cardNo,
-        deviceRole: user.role
+        deviceRole: user.role,
+
+        // Any user successfully read from the active F28 terminal
+        // should be considered active in the employee directory/reporting.
+        active: true
       };
 
       const matchers = [

@@ -42,6 +42,22 @@ const employeeSchema = new mongoose.Schema(
       default: ''
     },
 
+    // Employment dates used by leave-policy validation.
+    dateOfJoining: {
+      type: Date,
+      default: null
+    },
+
+    probationEndDate: {
+      type: Date,
+      default: null
+    },
+
+    noticePeriodStartDate: {
+      type: Date,
+      default: null
+    },
+
     // ========================================================
     // ZKTECO DEVICE INFORMATION
     // ========================================================

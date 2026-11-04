@@ -35,7 +35,18 @@ const attendanceSchema = new mongoose.Schema({
   isAutoCheckout: { type: Boolean, default: false },
 
   correctionReason: { type: String, default: '' },
-  correctedAt: { type: Date, default: null }
+  correctedAt: { type: Date, default: null },
+
+  // Approved late-arrival compensation. Keep the original biometric punch
+  // unchanged and subtract this allowance only when reports are calculated.
+  lateCompensationMinutes: { type: Number, default: 0, min: 0 },
+  lateCompensationReason: { type: String, default: '' },
+  lateCompensatedAt: { type: Date, default: null },
+  lateCompensatedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AdminUser',
+    default: null
+  }
 }, { timestamps: true });
 
 // Same device/user/timestamp cannot be imported twice.

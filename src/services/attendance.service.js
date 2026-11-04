@@ -4,6 +4,7 @@ const { Attendance, Employee, Shift, Rule } = require('../models');
 const { stateToPunchType, verificationLabel, attendanceStateLabel } = require('../utils/punches');
 const { startOfDay, endOfDay } = require('../utils/time');
 const { getAttendancePolicy, classifyDay } = require('../utils/attendance-policy');
+const { getEffectiveShift, getDefaultShift } = require('./shift-assignment.service');
 
 let broadcaster = null;
 
@@ -50,13 +51,7 @@ async function getEmployeeByDevice(userId, userSn) {
 }
 
 async function getEmployeeShift(employee) {
-  if (employee?.shiftId) {
-    const shift = await Shift.findById(employee.shiftId).lean();
-    if (shift) return shift;
-  }
-  const rule = await Rule.findOne().lean();
-  if (rule?.defaultShiftId) return Shift.findById(rule.defaultShiftId).lean();
-  return null;
+  return getDefaultShift(employee);
 }
 
 async function getRule() {
@@ -72,22 +67,33 @@ function timeOnDate(date, hhmm) {
   return d;
 }
 
-async function getScheduledCheckoutAt(timestamp) {
+async function getScheduledCheckoutAt(timestamp, employee = null) {
   const rule = await getRule();
   if (!rule.autoCheckoutEnabled) return null;
 
   const punchAt = new Date(timestamp);
+
+  if (employee?.employeeId) {
+    const effective = await getEffectiveShift(employee, punchAt);
+    const isDateSpecific = ['single_date', 'date_range', 'recurring'].includes(String(effective?.source || ''));
+    if (isDateSpecific && effective?.shift?.endTime) {
+      let shiftEnd = timeOnDate(punchAt, effective.shift.endTime);
+      const shiftStart = timeOnDate(punchAt, effective.shift.startTime || '00:00');
+      if (shiftEnd <= shiftStart) shiftEnd.setDate(shiftEnd.getDate() + 1);
+      if (punchAt < shiftEnd) return shiftEnd;
+      return null;
+    }
+  }
+
   const midday = timeOnDate(punchAt, rule.middayAutoCheckoutTime || '13:00');
   const dayEnd = timeOnDate(punchAt, rule.dayEndAutoCheckoutTime || '17:30');
 
-  // Split-day mode closes the morning session at 13:00. The employee then
-  // checks in again for the afternoon session (normally from 13:30).
-  if (rule.halfDayEnabled && punchAt < midday) return midday;
+  if (rule.noonAutoCheckoutEnabled !== false && punchAt < midday) return midday;
   if (punchAt < dayEnd) return dayEnd;
   return null;
 }
 
-async function getRequiredMinutes(employee) {
+async function getRequiredMinutes(employee, date = new Date()) {
   const rule = await getRule();
 
   // Legacy-compatible flag name, but the value now comes from /api/rules.
@@ -98,8 +104,8 @@ async function getRequiredMinutes(employee) {
     return Math.max(1, Number.isFinite(configured) ? configured : 480);
   }
 
-  const shift = await getEmployeeShift(employee);
-  const required = Number(shift?.requiredMinutes ?? rule.fullDayMinutes ?? 480);
+  const effective = await getEffectiveShift(employee, date);
+  const required = Number(effective?.shift?.requiredMinutes ?? rule.fullDayMinutes ?? 480);
   return Math.max(1, Number.isFinite(required) ? required : 480);
 }
 
@@ -171,7 +177,7 @@ async function createPunch({
     // Every IN starts a fresh session. Auto-checkout is tied to the configured
     // workday boundary (13:00 or 17:30), not to a duration from first check-in.
     resolvedSessionId = resolvedSessionId || makeSessionId();
-    autoCheckoutAt = await getScheduledCheckoutAt(timestamp);
+    autoCheckoutAt = await getScheduledCheckoutAt(timestamp, employee);
   } else {
     resolvedSessionId = resolvedSessionId || previous?.sessionId || makeSessionId();
   }
@@ -364,7 +370,7 @@ async function getTodayStatus(employeeId) {
     dayClassification.fullDay = true;
   }
 
-  const requiredMinutes = await getRequiredMinutes(employee);
+  const requiredMinutes = await getRequiredMinutes(employee, new Date());
   const overtimeMinutes = Math.max(0, workingMinutes - requiredMinutes);
 
   // Reuse the report engine for today's final attendance credit and late-streak
@@ -405,6 +411,26 @@ async function getTodayStatus(employeeId) {
     attendanceRule
   };
 }
+// Refresh only the latest punch for each employee; do not update already-closed sessions.
+// A changed noon toggle takes effect without restarting the backend.
+async function rescheduleOpenSessions() {
+  const rule = await getRule();
+  const latest = await Attendance.aggregate([
+    { $sort: { employeeId: 1, timestamp: -1, _id: -1 } },
+    { $group: { _id: '$employeeId', punch: { $first: '$$ROOT' } } },
+    { $match: { 'punch.punchType': 'IN' } }
+  ]);
+  let updated = 0;
+  for (const row of latest) {
+    const employee = await Employee.findOne({ employeeId: row._id, active: true }).lean();
+    if (!employee) continue;
+    const due = rule.autoCheckoutEnabled ? await getScheduledCheckoutAt(row.punch.timestamp, employee) : null;
+    await Attendance.updateOne({ _id: row.punch._id }, { $set: { autoCheckoutAt: due } });
+    updated++;
+  }
+  return { updated };
+}
+
 async function autoCheckoutOpenSessions(now = new Date()) {
   const rule = await getRule();
   if (!rule.autoCheckoutEnabled) return { checkedOut: 0, skipped: 0, candidates: 0, disabled: true };
@@ -435,10 +461,17 @@ async function autoCheckoutOpenSessions(now = new Date()) {
       continue;
     }
 
+    const effectiveAt = await getScheduledCheckoutAt(openPunch.timestamp, employee);
+    if (!effectiveAt || effectiveAt > now) {
+      await Attendance.updateOne({ _id: openPunch._id }, { $set: { autoCheckoutAt: effectiveAt } });
+      skipped++;
+      continue;
+    }
+
     const result = await createPunch({
       employee,
       punchType: 'OUT',
-      timestamp: new Date(openPunch.autoCheckoutAt),
+      timestamp: effectiveAt,
       source: 'AUTO',
       rawData: {
         source: 'AUTO_CHECKOUT',
@@ -531,6 +564,7 @@ module.exports = {
   webCheckOut,
   getTodayStatus,
   autoCheckoutOpenSessions,
+  rescheduleOpenSessions,
   getEmployeeShift,
   getRequiredMinutes,
   getRule,

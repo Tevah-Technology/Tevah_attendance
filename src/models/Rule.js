@@ -24,7 +24,22 @@ const ruleSchema = new mongoose.Schema({
   middayAutoCheckoutTime: { type: String, default: '13:00' },
   afternoonStartTime: { type: String, default: '13:30' },
   dayEndAutoCheckoutTime: { type: String, default: '17:30' },
-  autoCheckoutEnabled: { type: Boolean, default: true }
+  autoCheckoutEnabled: { type: Boolean, default: true },
+  // Independent of half-day classification; existing installations retain noon behavior.
+  noonAutoCheckoutEnabled: { type: Boolean, default: true },
+  webLocationRequired: { type: Boolean, default: false },
+  geofenceEnabled: {type:Boolean,default:false},
+  geofenceCheckIn: {type:Boolean,default:true},
+  geofenceCheckOut: {type:Boolean,default:true},
+  geofenceLatitude: {type:Number,default:null,min:-90,max:90},
+  geofenceLongitude: {type:Number,default:null,min:-180,max:180},
+  geofenceRadiusMeters: {type:Number,default:150,min:25,max:5000},
+  geofenceMaxAccuracyMeters: {type:Number,default:75,min:5,max:500},
+  // Native OS-managed geofence events; disabled until a mobile app is installed.
+  autoGeofenceEnabled: {type:Boolean,default:false},
+  autoGeofenceCheckIn: {type:Boolean,default:true},
+  autoGeofenceCheckOut: {type:Boolean,default:true},
+  autoGeofenceExitDelaySeconds: {type:Number,default:90,min:30,max:600}
 }, { timestamps: true });
 
 module.exports = mongoose.model('Rule', ruleSchema);

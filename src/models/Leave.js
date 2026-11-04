@@ -15,6 +15,11 @@ const leaveSchema = new mongoose.Schema({
   halfDay: { type: Boolean, default: false },
   halfDayPeriod: { type: String, enum: ['FIRST', 'SECOND', ''], default: '' },
   managerRemarks: { type: String, default: '' },
+  documentRequired: { type: Boolean, default: false },
+  documentSubmitted: { type: Boolean, default: false },
+  documentUrl: { type: String, default: '' },
+  documentName: { type: String, default: '' },
+  policySnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
   appliedAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 

@@ -1,5 +1,6 @@
 const { Attendance } = require('../models');
 const attendanceService = require('../services/attendance.service');
+const { startOfDay, endOfDay } = require('../utils/time');
 
 const {
   buildReport,
@@ -478,6 +479,18 @@ async function employeeDay(req, res) {
         correctedAt:
           punch.correctedAt ||
           null,
+
+        lateCompensationMinutes:
+          Number(punch.lateCompensationMinutes || 0),
+
+        lateCompensationReason:
+          punch.lateCompensationReason || '',
+
+        lateCompensatedAt:
+          punch.lateCompensatedAt || null,
+
+        lateCompensatedBy:
+          punch.lateCompensatedBy || null,
       }));
 
     // --------------------------------------------------------
@@ -528,6 +541,105 @@ async function employeeDay(req, res) {
       message:
         error.message ||
         'Failed to load employee attendance',
+    });
+  }
+}
+
+
+// ============================================================
+// COMPENSATE LATE ARRIVAL
+// ============================================================
+// POST /api/attendance/employee/:employeeId/day/:date/compensate-late
+// Body: { minutes: 10, reason: 'Approved by manager' }
+// The original biometric timestamp is never changed.
+// ============================================================
+
+async function compensateLate(req, res) {
+  try {
+    const employeeId = String(req.params.employeeId || '').trim();
+    const date = String(req.params.date || '').trim();
+
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: 'Employee ID is required' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ success: false, message: 'Date must use YYYY-MM-DD format' });
+    }
+
+    const allowed = await assertEmployeeAllowed(req, employeeId);
+    if (!allowed) {
+      return res.status(403).json({
+        success: false,
+        message: 'Employee is outside your assigned data scope',
+        code: 'SCOPE_FORBIDDEN'
+      });
+    }
+
+    const requestedMinutes = Number(req.body?.minutes ?? 0);
+    if (!Number.isFinite(requestedMinutes) || requestedMinutes < 0) {
+      return res.status(400).json({ success: false, message: 'minutes must be a number greater than or equal to 0' });
+    }
+
+    const minutes = Math.round(requestedMinutes);
+    if (minutes > 240) {
+      return res.status(400).json({ success: false, message: 'Late compensation cannot exceed 240 minutes' });
+    }
+
+    const reason = String(req.body?.reason || '').trim();
+    if (minutes > 0 && !reason) {
+      return res.status(400).json({ success: false, message: 'A reason is required when compensating late time' });
+    }
+
+    const dateValue = new Date(`${date}T00:00:00`);
+    const start = startOfDay(dateValue);
+    const end = endOfDay(dateValue);
+
+    const firstIn = await Attendance.findOne({
+      employeeId,
+      punchType: 'IN',
+      timestamp: { $gte: start, $lte: end }
+    }).sort({ timestamp: 1 });
+
+    if (!firstIn) {
+      return res.status(404).json({ success: false, message: 'No IN punch found for this employee/date' });
+    }
+
+    const rows = await buildReport({ from: date, to: date, employeeId });
+    const day = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+    const rawLateMinutes = Math.max(0, Number(day?.rawLateMinutes ?? day?.lateMinutes ?? 0));
+    const appliedMinutes = Math.min(minutes, rawLateMinutes);
+
+    firstIn.lateCompensationMinutes = appliedMinutes;
+    firstIn.lateCompensationReason = appliedMinutes > 0 ? reason : '';
+    firstIn.lateCompensatedAt = appliedMinutes > 0 ? new Date() : null;
+    firstIn.lateCompensatedBy = appliedMinutes > 0 ? (req.user?._id || null) : null;
+    await firstIn.save();
+
+    const refreshedRows = await buildReport({ from: date, to: date, employeeId });
+    const refreshed = Array.isArray(refreshedRows) && refreshedRows.length > 0 ? refreshedRows[0] : null;
+
+    return res.json({
+      success: true,
+      message: appliedMinutes > 0
+        ? `${appliedMinutes} late minute(s) compensated`
+        : 'Late compensation cleared',
+      employeeId,
+      date,
+      compensation: {
+        rawLateMinutes,
+        requestedMinutes: minutes,
+        appliedMinutes,
+        reason: appliedMinutes > 0 ? reason : '',
+        compensatedAt: firstIn.lateCompensatedAt,
+        compensatedBy: firstIn.lateCompensatedBy
+      },
+      attendance: refreshed
+    });
+  } catch (error) {
+    console.error('Late compensation error:', error);
+    return res.status(400).json({
+      success: false,
+      message: error.message || 'Failed to compensate late time'
     });
   }
 }
@@ -710,7 +822,12 @@ async function selfCheckIn(req, res) {
       });
     }
 
+    const locationRule = await attendanceService.getRule();
+    const {location: validatedLocation, geofence} = require('../utils/geofence').validateForAttendance(req.body, locationRule, 'in');
+    const location = await require('../utils/reverse-geocode').enrichWebLocation(validatedLocation);
     const result = await attendanceService.webCheckIn(employeeId, {
+      location,
+      ...(geofence ? {geofence} : {}),
       accountId: String(req.user?._id || ''),
       ip: req.ip,
       userAgent: req.get('user-agent') || ''
@@ -745,7 +862,12 @@ async function selfCheckOut(req, res) {
       });
     }
 
+    const locationRule = await attendanceService.getRule();
+    const {location: validatedLocation, geofence} = require('../utils/geofence').validateForAttendance(req.body, locationRule, 'out');
+    const location = await require('../utils/reverse-geocode').enrichWebLocation(validatedLocation);
     const result = await attendanceService.webCheckOut(employeeId, {
+      location,
+      ...(geofence ? {geofence} : {}),
       accountId: String(req.user?._id || ''),
       ip: req.ip,
       userAgent: req.get('user-agent') || ''
@@ -780,6 +902,7 @@ module.exports = {
   stream,
   employeeDay,
   update,
+  compensateLate,
   selfStatus,
   selfCheckIn,
   selfCheckOut,
