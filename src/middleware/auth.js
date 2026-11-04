@@ -31,7 +31,6 @@ function requireRoles(...roles) {
   };
 }
 
-
 function requirePermission(permission) {
   return (req, res, next) => {
     if (!req.access || !hasPermission(req.access, permission)) {

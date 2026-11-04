@@ -1,7 +1,11 @@
-const { Leave, LeaveType, Employee } = require('../models');
+const { Leave, Employee } = require('../models');
 const { notifyEmployee } = require('../services/notification.service');
 const { restrictEmployeeFilter, assertEmployeeAllowed } = require('../services/access-scope.service');
-const { getEmployeeLeaveBalances, resolveLeaveType, assertLeaveAvailable } = require('../services/leave.service');
+const {
+  getEmployeeLeaveBalances,
+  resolveLeaveType,
+  validateLeaveRequest
+} = require('../services/leave.service');
 
 function normalizeStatus(leave) {
   if (leave.status) return leave.status;
@@ -19,6 +23,31 @@ function normalizeDates(body) {
   return { fromDate: from, toDate: to, date: from };
 }
 
+function hasPermission(req, permission) {
+  return req.access?.roleCode === 'SUPER_ADMIN' || req.access?.permissions?.includes(permission);
+}
+
+function isAdminGrant(req) {
+  return hasPermission(req, 'leave.grant');
+}
+
+function policySnapshot(validation) {
+  return {
+    maxLeaveDaysPerMonth: validation.policy.maxLeaveDaysPerMonth,
+    maxLeaveDaysPerYear: validation.policy.maxLeaveDaysPerYear,
+    minimumAdvanceNoticeDays: validation.policy.minimumAdvanceNoticeDays,
+    includeWeekendsInLeaveDays: validation.policy.includeWeekendsInLeaveDays,
+    includeHolidaysInLeaveDays: validation.policy.includeHolidaysInLeaveDays,
+    approvalRequired: validation.policy.approvalRequired,
+    negativeBalanceAllowed: validation.policy.negativeBalanceAllowed,
+    maxNegativeBalanceDays: validation.policy.maxNegativeBalanceDays,
+    documentRequired: validation.documentRequired,
+    documentRequiredAfterDays: validation.policy.documentRequiredAfterDays,
+    excludedWeekends: validation.excludedWeekends,
+    excludedHolidays: validation.excludedHolidays
+  };
+}
+
 async function list(req, res) {
   try {
     const filter = {};
@@ -28,21 +57,35 @@ async function list(req, res) {
     const scopedFilter = await restrictEmployeeFilter(req, filter);
     const leaves = await Leave.find(scopedFilter).sort({ fromDate: -1, date: -1 }).lean();
     res.json({ success: true, count: leaves.length, leaves: leaves.map(l => ({ ...l, status: normalizeStatus(l) })) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 }
 
 async function create(req, res) {
   try {
     if (!req.body.employeeId) return res.status(400).json({ success: false, message: 'employeeId is required' });
-    if (!(await assertEmployeeAllowed(req, req.body.employeeId))) return res.status(403).json({ success: false, message: 'Employee is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
+    if (!(await assertEmployeeAllowed(req, req.body.employeeId))) {
+      return res.status(403).json({ success: false, message: 'Employee is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
+    }
+
     const dates = normalizeDates(req.body);
-    const status = String(req.body.status || 'PENDING').toUpperCase();
-    if (!['PENDING', 'APPROVED', 'REJECTED'].includes(status)) throw new Error('Invalid leave status');
-    const days = Number(req.body.days || Math.max(1, Math.floor((dates.toDate - dates.fromDate) / 86400000) + 1));
-    if (!Number.isFinite(days) || days <= 0) throw new Error('days must be greater than 0');
     const leaveType = await resolveLeaveType(req.body);
     if (req.body.leaveTypeId && !leaveType) throw new Error('Leave type not found');
-    if (leaveType) await assertLeaveAvailable(req.body.employeeId, leaveType, days, status);
+
+    const requestedStatus = String(req.body.status || 'PENDING').toUpperCase();
+    const documentSubmitted = Boolean(req.body.documentSubmitted || String(req.body.documentUrl || '').trim());
+    const validation = await validateLeaveRequest({
+      employeeId: req.body.employeeId,
+      leaveType,
+      fromDate: dates.fromDate,
+      toDate: dates.toDate,
+      halfDay: Boolean(req.body.halfDay),
+      requestedStatus,
+      documentSubmitted,
+      isAdminGrant: isAdminGrant(req)
+    });
+
     const leave = await Leave.create({
       ...req.body,
       leaveTypeId: leaveType?._id || req.body.leaveTypeId || null,
@@ -50,29 +93,46 @@ async function create(req, res) {
       date: dates.date,
       fromDate: dates.fromDate,
       toDate: dates.toDate,
-      days,
-      status,
-      approved: status === 'APPROVED',
+      days: validation.days,
+      status: validation.status,
+      approved: validation.status === 'APPROVED',
+      documentRequired: validation.documentRequired,
+      documentSubmitted,
+      documentUrl: String(req.body.documentUrl || ''),
+      documentName: String(req.body.documentName || ''),
+      policySnapshot: policySnapshot(validation),
       appliedAt: req.body.appliedAt || new Date()
     });
-    res.status(201).json({ success: true, leave: { ...leave.toObject(), status } });
-  } catch (e) { res.status(e.statusCode || 400).json({ success: false, code: e.code || 'LEAVE_CREATE_FAILED', message: e.message, balance: e.balance || null }); }
-}
 
+    res.status(201).json({
+      success: true,
+      leave: { ...leave.toObject(), status: validation.status },
+      policy: {
+        chargedDays: validation.days,
+        excludedWeekends: validation.excludedWeekends,
+        excludedHolidays: validation.excludedHolidays,
+        documentRequired: validation.documentRequired,
+        approvalRequired: validation.policy.approvalRequired
+      }
+    });
+  } catch (e) {
+    res.status(e.statusCode || 400).json({
+      success: false,
+      code: e.code || 'LEAVE_CREATE_FAILED',
+      message: e.message,
+      balance: e.balance || null,
+      details: e.details || null
+    });
+  }
+}
 
 async function update(req, res) {
   try {
     const existing = await Leave.findById(req.params.id).lean();
-    if (!existing) {
-      return res.status(404).json({ success: false, message: 'Leave request not found' });
-    }
+    if (!existing) return res.status(404).json({ success: false, message: 'Leave request not found' });
 
     if (!(await assertEmployeeAllowed(req, existing.employeeId))) {
-      return res.status(403).json({
-        success: false,
-        message: 'Leave is outside your assigned data scope',
-        code: 'SCOPE_FORBIDDEN'
-      });
+      return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
     }
 
     const currentStatus = normalizeStatus(existing);
@@ -86,78 +146,99 @@ async function update(req, res) {
 
     const merged = { ...existing, ...req.body };
     const dates = normalizeDates(merged);
-    const days = Number(
-      req.body.days ??
-      Math.max(1, Math.floor((dates.toDate - dates.fromDate) / 86400000) + 1)
-    );
-    if (!Number.isFinite(days) || days <= 0) throw new Error('days must be greater than 0');
-
     const leaveType = await resolveLeaveType({
       leaveTypeId: req.body.leaveTypeId ?? existing.leaveTypeId,
       type: req.body.type ?? existing.type
     });
-    if ((req.body.leaveTypeId ?? existing.leaveTypeId) && !leaveType) {
-      throw new Error('Leave type not found');
-    }
-    if (leaveType) {
-      await assertLeaveAvailable(existing.employeeId, leaveType, days, 'PENDING', {
-        excludeLeaveId: existing._id
-      });
-    }
+    if ((req.body.leaveTypeId ?? existing.leaveTypeId) && !leaveType) throw new Error('Leave type not found');
+
+    const halfDay = Boolean(req.body.halfDay ?? existing.halfDay);
+    const documentUrl = String(req.body.documentUrl ?? existing.documentUrl ?? '');
+    const documentSubmitted = Boolean(req.body.documentSubmitted ?? existing.documentSubmitted ?? documentUrl.trim());
+    const validation = await validateLeaveRequest({
+      employeeId: existing.employeeId,
+      leaveType,
+      fromDate: dates.fromDate,
+      toDate: dates.toDate,
+      halfDay,
+      requestedStatus: 'PENDING',
+      excludeLeaveId: existing._id,
+      documentSubmitted,
+      isAdminGrant: false
+    });
 
     const patch = {
       date: dates.date,
       fromDate: dates.fromDate,
       toDate: dates.toDate,
-      days,
+      days: validation.days,
       leaveTypeId: leaveType?._id || req.body.leaveTypeId || existing.leaveTypeId || null,
       type: leaveType?.name || req.body.type || existing.type || 'Leave',
       reason: req.body.reason ?? existing.reason ?? '',
-      halfDay: Boolean(req.body.halfDay ?? existing.halfDay),
-      halfDayPeriod: (req.body.halfDay ?? existing.halfDay)
+      halfDay,
+      halfDayPeriod: halfDay
         ? String(req.body.halfDayPeriod ?? existing.halfDayPeriod ?? 'FIRST').toUpperCase()
         : '',
-      status: 'PENDING',
-      approved: false,
-      managerRemarks: ''
+      status: validation.status,
+      approved: validation.status === 'APPROVED',
+      managerRemarks: '',
+      documentRequired: validation.documentRequired,
+      documentSubmitted,
+      documentUrl,
+      documentName: String(req.body.documentName ?? existing.documentName ?? ''),
+      policySnapshot: policySnapshot(validation)
     };
 
-    if (!['FIRST', 'SECOND', ''].includes(patch.halfDayPeriod)) {
-      throw new Error('halfDayPeriod must be FIRST or SECOND');
-    }
+    if (!['FIRST', 'SECOND', ''].includes(patch.halfDayPeriod)) throw new Error('halfDayPeriod must be FIRST or SECOND');
 
-    const leave = await Leave.findByIdAndUpdate(
-      req.params.id,
-      { $set: patch },
-      { new: true, runValidators: true }
-    ).lean();
-
-    return res.json({
-      success: true,
-      message: 'Leave request updated',
-      leave: { ...leave, status: 'PENDING' }
-    });
+    const leave = await Leave.findByIdAndUpdate(req.params.id, { $set: patch }, { new: true, runValidators: true }).lean();
+    return res.json({ success: true, message: 'Leave request updated', leave: { ...leave, status: validation.status } });
   } catch (e) {
     return res.status(e.statusCode || 400).json({
       success: false,
       code: e.code || 'LEAVE_UPDATE_FAILED',
       message: e.message,
-      balance: e.balance || null
+      balance: e.balance || null,
+      details: e.details || null
     });
   }
 }
 
 async function approve(req, res) {
   try {
-    const existing = await Leave.findById(req.params.id).select('employeeId').lean();
+    const existing = await Leave.findById(req.params.id).lean();
     if (!existing) return res.status(404).json({ success: false, message: 'Leave request not found' });
-    if (!(await assertEmployeeAllowed(req, existing.employeeId))) return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
-    const leave = await Leave.findByIdAndUpdate(req.params.id,
+    if (!(await assertEmployeeAllowed(req, existing.employeeId))) {
+      return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
+    }
+    if (existing.documentRequired && !existing.documentSubmitted && !String(existing.documentUrl || '').trim()) {
+      return res.status(409).json({
+        success: false,
+        code: 'LEAVE_DOCUMENT_REQUIRED',
+        message: 'A supporting document is required before this leave can be approved.'
+      });
+    }
+
+    const leave = await Leave.findByIdAndUpdate(
+      req.params.id,
       { $set: { status: 'APPROVED', approved: true, managerRemarks: req.body.managerRemarks || '' } },
-      { new: true, runValidators: true }).lean();
-    try { await notifyEmployee(leave.employeeId, 'leaveDecision', 'Leave request approved', `Your leave request from ${new Date(leave.fromDate || leave.date).toLocaleDateString()} to ${new Date(leave.toDate || leave.date).toLocaleDateString()} has been approved.`); } catch (notifyError) { console.error('Leave approval notification failed:', notifyError.message); }
+      { new: true, runValidators: true }
+    ).lean();
+
+    try {
+      await notifyEmployee(
+        leave.employeeId,
+        'leaveDecision',
+        'Leave request approved',
+        `Your leave request from ${new Date(leave.fromDate || leave.date).toLocaleDateString()} to ${new Date(leave.toDate || leave.date).toLocaleDateString()} has been approved.`
+      );
+    } catch (notifyError) {
+      console.error('Leave approval notification failed:', notifyError.message);
+    }
     res.json({ success: true, message: 'Leave approved', leave: { ...leave, status: 'APPROVED' } });
-  } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+  } catch (e) {
+    res.status(e.statusCode || 400).json({ success: false, code: e.code || 'LEAVE_APPROVE_FAILED', message: e.message });
+  }
 }
 
 async function reject(req, res) {
@@ -167,17 +248,32 @@ async function reject(req, res) {
     const existing = await Leave.findById(req.params.id).select('employeeId').lean();
     if (!existing) return res.status(404).json({ success: false, message: 'Leave request not found' });
     if (!(await assertEmployeeAllowed(req, existing.employeeId))) return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
-    const leave = await Leave.findByIdAndUpdate(req.params.id,
+    const leave = await Leave.findByIdAndUpdate(
+      req.params.id,
       { $set: { status: 'REJECTED', approved: false, managerRemarks: reason } },
-      { new: true, runValidators: true }).lean();
-    try { await notifyEmployee(leave.employeeId, 'leaveDecision', 'Leave request rejected', `Your leave request was rejected. Reason: ${reason}`); } catch (notifyError) { console.error('Leave rejection notification failed:', notifyError.message); }
+      { new: true, runValidators: true }
+    ).lean();
+    try {
+      await notifyEmployee(leave.employeeId, 'leaveDecision', 'Leave request rejected', `Your leave request was rejected. Reason: ${reason}`);
+    } catch (notifyError) {
+      console.error('Leave rejection notification failed:', notifyError.message);
+    }
     res.json({ success: true, message: 'Leave rejected', leave: { ...leave, status: 'REJECTED' } });
-  } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
 }
 
 async function remove(req, res) {
-  try { const existing = await Leave.findById(req.params.id).select('employeeId').lean(); if (!existing) return res.status(404).json({ success: false, message: 'Leave request not found' }); if (!(await assertEmployeeAllowed(req, existing.employeeId))) return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' }); const result = await Leave.findByIdAndDelete(req.params.id); res.json({ success: true, deleted: Boolean(result) }); }
-  catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  try {
+    const existing = await Leave.findById(req.params.id).select('employeeId').lean();
+    if (!existing) return res.status(404).json({ success: false, message: 'Leave request not found' });
+    if (!(await assertEmployeeAllowed(req, existing.employeeId))) return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
+    const result = await Leave.findByIdAndDelete(req.params.id);
+    res.json({ success: true, deleted: Boolean(result) });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 }
 
 async function calendar(req, res) {
@@ -192,7 +288,9 @@ async function calendar(req, res) {
     const scopedFilter = await restrictEmployeeFilter(req, filter);
     const leaves = await Leave.find(scopedFilter).sort({ fromDate: 1, date: 1 }).lean();
     res.json({ success: true, from, to, leaves });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 }
 
 async function balances(req, res) {
@@ -209,7 +307,9 @@ async function balances(req, res) {
       }
     }
     res.json({ success: true, year, data });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 }
 
 module.exports = { list, create, update, approve, reject, remove, calendar, balances };
